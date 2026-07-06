@@ -11,6 +11,12 @@ import (
 	"go.temporal.io/sdk/client"
 )
 
+// WALKTHROUGH — the STARTER is just a client that starts a workflow. It is a standalone
+//   binary here ONLY because this is a demo. In dev-commerce-engine there is no starter
+//   binary: the ExecuteWorkflow call lives INSIDE a service method (like fulfilment's
+//   IngestRequest -> executor.StartRequest), triggered by the fulfilment-request manifest.
+//   Likewise cancelsubscription/ and querybillinginfo/ become Cancel/Query API methods,
+//   not separate binaries.
 func main() {
 	// The client is a heavyweight object that should be created once per process.
 	c, err := client.NewClient(client.Options{})

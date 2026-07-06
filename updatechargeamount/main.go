@@ -9,6 +9,12 @@ import (
 	"go.temporal.io/sdk/client"
 )
 
+// WALKTHROUGH — sends the [#3] "billingperiodcharge" SIGNAL to change the amount mid-run.
+//   SignalWorkflow(ctx, workflowID, runID, signalName, payload) delivers 300 into each
+//   running workflow; the handler in workflow.go applies it between steps (no race with
+//   the billing loop), so the NEXT charge uses the new amount. In dev-commerce-engine
+//   this is a "change plan / update amount" API method, not a binary. It loops over the
+//   5 demo IDs "SubscriptionsWorkflowId-0".."-4".
 func main() {
 	// The client is a heavyweight object that should be created once per process.
 	c, err := client.NewClient(client.Options{})

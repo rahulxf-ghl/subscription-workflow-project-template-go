@@ -2,7 +2,7 @@
 # Requires: Go, and the Temporal CLI (https://docs.temporal.io/cli) for `make temporal`.
 
 .PHONY: help deps build temporal worker start cancel query ui tidy \
-        one reset worker-dunning worker-dunning-fail signal-cancel query-one
+        one reset worker-dunning worker-dunning-fail signal-cancel signal-amount query-one
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -41,6 +41,9 @@ reset: ## Terminate leftover demo workflows so the UI is clean
 
 signal-cancel: ## Cancel the single workflow (SubscriptionsWorkflowId-0)
 	temporal workflow signal --workflow-id SubscriptionsWorkflowId-0 --name cancelsubscription --input true
+
+signal-amount: ## Change the single workflow's charge amount to 300
+	temporal workflow signal --workflow-id SubscriptionsWorkflowId-0 --name billingperiodcharge --input 300
 
 query-one: ## Query the single workflow's current billing period
 	temporal workflow query --workflow-id SubscriptionsWorkflowId-0 --type billingperiodnumber

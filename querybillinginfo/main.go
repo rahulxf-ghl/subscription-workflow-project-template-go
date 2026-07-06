@@ -9,6 +9,11 @@ import (
 	"go.temporal.io/sdk/client"
 )
 
+// WALKTHROUGH — reads live state with a [#4] QUERY (no DB).
+//   QueryWorkflow(ctx, workflowID, runID, queryName) calls a read-only handler
+//   registered inside the workflow and returns its current in-memory value here it
+//   reads "billingperiodnumber" and "billingperiodchargeamount". In dev-commerce-engine
+//   this becomes a Get/Query API method. Queries never mutate state.
 func main() {
 	// The client is a heavyweight object that should be created once per process.
 	c, err := client.NewClient(client.Options{})

@@ -10,6 +10,11 @@ import (
 	"subscription-workfow"
 )
 
+// WALKTHROUGH — the WORKER is the process that runs workflow + activity code.
+//   In dev-commerce-engine this becomes cmd/subscription-worker, and instead of the
+//   raw client.NewClient/worker.New below it uses the shared common/temporal wrapper
+//   (NewClient + NewWorker) so TLS, config, and the task queue are consistent across
+//   modules. Owner: subscription team builds the worker; platform owns the wrapper.
 func main() {
 	// The client and Worker are heavyweight objects that should be created once per process.
 	c, err := client.NewClient(client.Options{})

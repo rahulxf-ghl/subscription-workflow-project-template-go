@@ -111,3 +111,19 @@ The template proves the *shape*. A real subscription that bills for years still 
    fulfilment request, not a standalone starter.
 7. **Hardening** — replace the `log.Fatalln` calls in the workflow (they'd crash the
    worker) with proper error returns, and route signals through one main Selector loop.
+
+---
+
+| Capability | Cloud Tasks / Cloud Run — what you build & maintain | Temporal — what you write |
+| --- | --- | --- |
+| Wait for next billing date | delayed Cloud Task **+** an authenticated callback HTTP endpoint **+** a `next_billing_date` DB column | `AwaitWithTimeout(BillingPeriod)` — 1 line |
+| Retry a failed charge (dunning) | attempt counter in DB, backoff math, re-enqueue-with-delay, dead-letter queue | a `RetryPolicy` struct (3 fields) |
+| Missed / stuck tasks | a reconciler cron that sweeps and re-drives | built in (nothing) |
+| Change / cancel mid-cycle | DB write **+** locking so it doesn't race the in-flight billing task | a **signal** (no lock) |
+| Read current state | a query endpoint over the DB row | a **Query** |
+| Don't double-charge on retry | idempotency keys **+** a dedupe store, checked everywhere | idempotency key on the activity |
+| Survive crash / deploy | make every step idempotent + resumable, then test it | automatic replay from history |
+| Audit every attempt | an audit table + a write on every attempt | Temporal history, free |
+| One run per customer | a uniqueness lock / guard | Workflow ID = customer ID |
+| Observability | dashboards for stuck/failed subs | one workflow list + timeline |
+| Local dev | Cloud Tasks is painful locally (tunnels/emulator) | `temporal server start-dev` |

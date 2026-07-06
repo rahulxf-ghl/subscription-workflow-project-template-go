@@ -3,6 +3,9 @@ package subscription
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"strconv"
 
 	"go.temporal.io/sdk/activity"
 )
@@ -42,8 +45,27 @@ func (a *Activities) SendCancellationEmailDuringTrialPeriod(ctx context.Context,
 // RetryPolicy declared in workflow.go retries it automatically (the "dunning" loop).
 // Real version: call PPC with an idempotency key derived from (customerId, periodNum)
 // so retries and replays never charge twice.
+//
+// DEMO KNOBS (so you can SEE dunning / failure) — set these on the WORKER process:
+//   CHARGE_FAIL_UNTIL_ATTEMPT=3  fail attempts 1 & 2, then succeed on attempt 3
+//                                (dunning that eventually goes through)
+//   CHARGE_FAIL_ALWAYS=1         every attempt fails -> dunning gives up after max
+//                                attempts and the workflow fails
+// activity.GetInfo(ctx).Attempt is the current try number, supplied by Temporal.
 func (a *Activities) ChargeCustomerForBillingPeriod(ctx context.Context, customer Customer) (string, error) {
-	activity.GetLogger(ctx).Info("charging customer for billing period.")
+	logger := activity.GetLogger(ctx)
+	attempt := activity.GetInfo(ctx).Attempt
+
+	failUntil := 0
+	if v, err := strconv.Atoi(os.Getenv("CHARGE_FAIL_UNTIL_ATTEMPT")); err == nil {
+		failUntil = v
+	}
+	if os.Getenv("CHARGE_FAIL_ALWAYS") == "1" || (failUntil > 0 && int(attempt) < failUntil) {
+		logger.Warn("charge FAILED (simulated) — Temporal will retry per RetryPolicy", "attempt", attempt)
+		return "", fmt.Errorf("simulated charge decline on attempt %d for %s", attempt, customer.Id)
+	}
+
+	logger.Info("charging customer for billing period.", "attempt", attempt)
 	return "Charging for billing period completed for: " + customer.Id, nil
 }
 

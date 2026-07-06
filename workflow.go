@@ -2,7 +2,6 @@
 package subscription
 
 import (
-	"log"
 	"time"
 
 	"go.temporal.io/sdk/temporal"
@@ -81,24 +80,13 @@ func SubscriptionWorkflow(ctx workflow.Context, customer Customer) (string, erro
 	//     main.go). It is delivered into THIS running workflow and applied between
 	//     steps, so it can never race the billing loop. No locks, no correlation table.
 	//
-	// Define signal channels
-	// 1) billing period charge change signal
-	chargeSelector := workflow.NewSelector(ctx)
-	signalCh := workflow.GetSignalChannel(ctx, "billingperiodcharge")
-	chargeSelector.AddReceive(signalCh, func(ch workflow.ReceiveChannel, _ bool) {
-		var chargeSignal int
-		ch.Receive(ctx, &chargeSignal)
-		workflowCustomer.Subscription.BillingPeriodCharge = chargeSignal
-	})
-	// 2) cancel subscription signal
-	cancelSelector := workflow.NewSelector(ctx)
+	// Just grab the signal channels here. We CONSUME them inside the waitOrTimeout
+	// helper (defined below) using a single Selector — the correct pattern.
+	// (The original template registered AddReceive callbacks but then waited on
+	// HasPending() without ever calling Select(), so a cancel signal was received
+	// but never applied — the billing loop then charged every period anyway.)
+	chargeCh := workflow.GetSignalChannel(ctx, "billingperiodcharge")
 	cancelCh := workflow.GetSignalChannel(ctx, "cancelsubscription")
-	cancelSelector.AddReceive(cancelCh, func(ch workflow.ReceiveChannel, _ bool) {
-		var cancelSubSignal bool
-		ch.Receive(ctx, &cancelSubSignal)
-		subscriptionCancelled = cancelSubSignal
-	})
-	// end defining signal channels
 
 	// [#2] RETRY / DUNNING — "retry a failed charge on a schedule":
 	//   Cloud Run version: on a failed charge, re-enqueue a Cloud Task, keep an attempt
@@ -112,21 +100,45 @@ func SubscriptionWorkflow(ctx workflow.Context, customer Customer) (string, erro
 	ao := workflow.ActivityOptions{
 		StartToCloseTimeout: time.Minute * 5,
 		RetryPolicy: &temporal.RetryPolicy{
-			InitialInterval:    time.Second * 60, // first retry after 60s
-			BackoffCoefficient: 2.0,              // double the wait each attempt
-			MaximumAttempts:    3,                // give up after 3 tries
+			InitialInterval:    time.Second * 5, // short so retries are watchable in the demo; PROD dunning uses 60s
+			BackoffCoefficient: 2.0,             // double the wait each attempt (5s, 10s, ...)
+			MaximumAttempts:    3,               // give up after 3 tries
 		},
 	}
 
 	ctx = workflow.WithActivityOptions(ctx, ao)
 	logger.Info("Subscription workflow started for: " + customer.Id)
 
+	// waitOrTimeout blocks up to d, but wakes EARLY and applies signals as they
+	// arrive. It uses ONE Selector that waits on the timer OR the signal channels,
+	// and actually consumes each signal. This is the fix for the cancel bug: a
+	// cancel now sets subscriptionCancelled and breaks the wait immediately.
+	waitOrTimeout := func(d time.Duration) {
+		timerCtx, cancelTimer := workflow.WithCancel(ctx)
+		defer cancelTimer()
+		timer := workflow.NewTimer(timerCtx, d)
+		timerFired := false
+		for !timerFired && !subscriptionCancelled {
+			sel := workflow.NewSelector(ctx)
+			sel.AddFuture(timer, func(workflow.Future) { timerFired = true })
+			sel.AddReceive(cancelCh, func(c workflow.ReceiveChannel, _ bool) {
+				c.Receive(ctx, &subscriptionCancelled) // "cancelsubscription" signal
+			})
+			sel.AddReceive(chargeCh, func(c workflow.ReceiveChannel, _ bool) {
+				var amount int
+				c.Receive(ctx, &amount) // "billingperiodcharge" signal
+				workflowCustomer.Subscription.BillingPeriodCharge = amount
+			})
+			sel.Select(ctx)
+		}
+	}
+
 	var activities *Activities
 
-	// Send welcome email to customer
+	// Send welcome email to customer (best-effort: log and continue, do NOT crash).
 	err = workflow.ExecuteActivity(ctx, activities.SendWelcomeEmail, workflowCustomer).Get(ctx, &actResult)
 	if err != nil {
-		log.Fatalln("Failure executing SendWelcomeEmail", err)
+		logger.Error("failed sending welcome email", "Error", err)
 	}
 
 	// [#1] DURABLE TIMER — "wait for a future moment (here: the whole trial period)":
@@ -136,16 +148,15 @@ func SubscriptionWorkflow(ctx workflow.Context, customer Customer) (string, erro
 	//   Temporal version : the workflow simply sleeps for TrialPeriod (could be 30 days)
 	//     and wakes itself. It costs ~nothing while asleep and survives deploys. The
 	//     second arg lets it wake EARLY if the customer cancels during the trial.
-	// Start the free trial period. User can still cancel subscription during this time
-	workflow.AwaitWithTimeout(ctx, workflowCustomer.Subscription.TrialPeriod, func() bool {
-		return subscriptionCancelled == true
-	})
+	// Start the free trial period. User can still cancel subscription during this time.
+	// waitOrTimeout wakes early if a cancel signal arrives during the trial.
+	waitOrTimeout(workflowCustomer.Subscription.TrialPeriod)
 
 	// If customer cancelled their subscription during trial period, send notification email
 	if subscriptionCancelled == true {
 		err = workflow.ExecuteActivity(ctx, activities.SendCancellationEmailDuringTrialPeriod, workflowCustomer).Get(ctx, &actResult)
 		if err != nil {
-			log.Fatalln("Failure executing SendCancellationEmailDuringTrialPeriod", err)
+			logger.Error("failed sending trial-cancellation email", "Error", err)
 		}
 		// We have completed subscription for this customer.
 		// Finishing workflow execution
@@ -167,30 +178,29 @@ func SubscriptionWorkflow(ctx workflow.Context, customer Customer) (string, erro
 		// Charge customer for the billing period
 		err = workflow.ExecuteActivity(ctx, activities.ChargeCustomerForBillingPeriod, workflowCustomer).Get(ctx, &actResult)
 		if err != nil {
-			log.Fatalln("Failure executing ChargeCustomerForBillingPeriod", err)
+			// Dunning gave up (all retries exhausted). Return the error so the WORKFLOW
+			// fails cleanly and shows as Failed in the UI. (The upstream template called
+			// log.Fatalln here, which crashes the whole worker — wrong for a real system.)
+			logger.Error("charge failed after all retries; failing subscription", "Error", err)
+			return "Subscription failed for: " + workflowCustomer.Id, err
 		}
 		// [#1] DURABLE TIMER — "wait for the next billing date":
 		//   Cloud Run version: a delayed Cloud Task + callback endpoint + next_billing_date
 		//     DB column + a reconciler cron for tasks that never fire.
 		//   Temporal version : sleep one BillingPeriod (e.g. ~30 days) right here, or wake
 		//     early if a cancel signal is pending. This single line replaces all of the above.
-		// Wait 1 billing period to charge customer or if they cancel subscription
-		// whichever comes first
-		workflow.AwaitWithTimeout(ctx, workflowCustomer.Subscription.BillingPeriod, cancelSelector.HasPending)
+		// Wait 1 billing period, OR wake early if a cancel/charge-change signal arrives.
+		waitOrTimeout(workflowCustomer.Subscription.BillingPeriod)
 
 		if subscriptionCancelled {
 			err = workflow.ExecuteActivity(ctx, activities.SendCancellationEmailDuringActiveSubscription, workflowCustomer).Get(ctx, &actResult)
 			if err != nil {
-				log.Fatalln("Failure executing SendCancellationEmailDuringActiveSubscription", err)
+				logger.Error("failed sending active-cancellation email", "Error", err)
 			}
 			break
 		}
 
 		billingPeriodNum++
-
-		for chargeSelector.HasPending() {
-			chargeSelector.Select(ctx)
-		}
 	}
 
 	// if we get here the subscription period is over
@@ -198,7 +208,7 @@ func SubscriptionWorkflow(ctx workflow.Context, customer Customer) (string, erro
 	if !subscriptionCancelled {
 		err = workflow.ExecuteActivity(ctx, activities.SendSubscriptionOverEmail, workflowCustomer).Get(ctx, &actResult)
 		if err != nil {
-			log.Fatalln("Failure executing SendSubscriptionOverEmail", err)
+			logger.Error("failed sending subscription-over email", "Error", err)
 		}
 	}
 
